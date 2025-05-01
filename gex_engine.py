@@ -2,10 +2,10 @@
 """
 gex_engine.py
 
-Automatisierte GEX-Berechnung für 0DTE SPX-Optionen via
-TradeStation Password Grant + Versand eines Webhooks an OptionAlpha.
+Automatisierte GEX‐Berechnung für 0DTE SPX‐Optionen via
+TradeStation Client Credentials Grant + Versand eines Webhooks an OptionAlpha.
 
-Dieser Script liest alle sensiblen Daten aus Umgebungs­variablen
+Dieser Script liest alle sensiblen Daten aus Umgebungsvariablen
 und kann deshalb sicher in GitHub Actions laufen.
 """
 
@@ -15,102 +15,97 @@ import datetime
 import requests
 import pandas as pd
 
-# === 1) Credentials aus Umgebungsvariablen ==============================
+# === 1) Credentials aus Umgebungsvariablen ==========================
 CLIENT_ID     = os.getenv('TS_CLIENT_ID')
 CLIENT_SECRET = os.getenv('TS_CLIENT_SECRET')
-USERNAME      = os.getenv('TS_USERNAME')
-PASSWORD      = os.getenv('TS_PASSWORD')
 OA_WEBHOOK    = os.getenv('OA_WEBHOOK')
 
-if not all([CLIENT_ID, CLIENT_SECRET, USERNAME, PASSWORD, OA_WEBHOOK]):
-    sys.exit("Missing env vars: TS_CLIENT_ID, TS_CLIENT_SECRET, "
-             "TS_USERNAME, TS_PASSWORD, OA_WEBHOOK")
+if not all([CLIENT_ID, CLIENT_SECRET, OA_WEBHOOK]):
+    sys.exit("Error: Missing env vars TS_CLIENT_ID, TS_CLIENT_SECRET or OA_WEBHOOK")
 
-# === 2) Token via Resource Owner Password Grant holen ===================
+# === 2) Token via Client Credentials Grant holen ===================
 token_url = 'https://signin.tradestation.com/oauth/token'
 token_data = {
-    'grant_type':    'password',
+    'grant_type':    'client_credentials',
     'client_id':     CLIENT_ID,
     'client_secret': CLIENT_SECRET,
-    'username':      USERNAME,
-    'password':      PASSWORD,
-    'scope':         'MarketData openid profile offline_access'
+    'audience':      'https://api.tradestation.com'
 }
+
 r = requests.post(token_url, data=token_data)
 if r.status_code != 200:
     sys.exit(f"Token-Request failed [{r.status_code}]: {r.text}")
+
 token = r.json().get('access_token')
 if not token:
     sys.exit("Error: no access_token in response")
 print("✅ Access Token erhalten.")
 
-# === 3) Options-Chain + Greeks laden ====================================
+# === 3) Options-Chain + Greeks laden ===============================
 headers = {'Authorization': f'Bearer {token}'}
-expiry = datetime.date.today().isoformat()  # z.B. "2025-05-01"
-chain_url = (
-    "https://api.tradestation.com/v3/marketdata/options/chains"
-    f"?symbolRoot=SPX&expirationDate={expiry}&includeGreeks=true"
+
+# Wir wollen nur 0DTE, also heute als Ablaufdatum
+today = datetime.date.today().isoformat()
+url = f"https://api.tradestation.com/v2/marketdata/etfs/optionschains/SPX?expirationdate={today}"
+
+resp = requests.get(url, headers=headers)
+if resp.status_code != 200:
+    sys.exit(f"Options-Chain request failed [{resp.status_code}]: {resp.text}")
+
+data = resp.json()
+chain_raw = data['optionChains'][0]['options']
+chain = pd.DataFrame(chain_raw)
+
+underlying_price = data.get('underlyingPrice')
+if underlying_price is None:
+    sys.exit("Error: underlyingPrice not found in response")
+print(f"Letzter SPX-Preis: {underlying_price}")
+
+# === 4) GEX, Call-/Put-Wall und Zero-Gamma-Level berechnen ==========
+# Gamma-Exposure in Shares (Gamma * OI * 100)
+chain['gex_shares'] = chain['greeks']['gamma'] * chain['openInterest'] * 100
+
+# Call- und Put-Wall (Strike mit größter absol. Exposure)
+calls = chain[chain['optionType'] == 'call']
+puts  = chain[chain['optionType'] == 'put']
+call_wall = float(calls.groupby('strikePrice')['gex_shares'].sum().abs().idxmax())
+put_wall  = float(puts.groupby('strikePrice')['gex_shares'].sum().abs().idxmax())
+
+# Netto-GEX ($ pro 1% Move) = Sum(gex_shares) * underlying_price / 100
+total_gex = float(chain['gex_shares'].sum() * underlying_price / 100.0)
+
+# Zero-Gamma-Level: erster Strike, bei dem kumul. GEX ≥ 0
+cum = (
+    chain
+    .groupby('strikePrice')['gex_shares']
+    .sum()
+    .sort_index()
+    .cumsum()
 )
-r = requests.get(chain_url, headers=headers)
-if r.status_code != 200:
-    sys.exit(f"Chain-Request failed [{r.status_code}]: {r.text}")
-data = r.json()
+zero_gamma = float(cum[cum >= 0].index.min())
 
-# === 4) GEX-Berechnung ===================================================
-rows = []
-for pair in data.get('optionPairs', []):
-    for leg in pair.get('legs', []):
-        greek = leg.get('greek') or {}
-        oi    = leg.get('openInterest', 0)
-        if 'gamma' in greek and oi > 0:
-            rows.append({
-                'strike': leg['strikePrice'],
-                'gamma':  greek['gamma'],
-                'oi':     oi
-            })
+print(f"Total-GEX: {total_gex:.0f} $/1%")
+print(f"Call-Wall: {call_wall}")
+print(f"Put-Wall:  {put_wall}")
+print(f"Zero-Gamma-Level: {zero_gamma}")
 
-if not rows:
-    sys.exit("Error: keine Optionsdaten erhalten")
+# === 5) Payload an Webhook senden =====================================
+sig = 'FLAT'
+if total_gex > 0:
+    sig = 'LONG'
+elif total_gex < 0:
+    sig = 'SHORT'
 
-df = pd.DataFrame(rows)
-df['gexShares'] = df['gamma'] * df['oi'] * 100
-
-# Unterliegenden Spot-Preis holen
-r2 = requests.get("https://api.tradestation.com/v3/marketdata/quotes/SPX", headers=headers)
-if r2.status_code != 200:
-    sys.exit(f"Spot-Request failed [{r2.status_code}]: {r2.text}")
-spot = r2.json().get('Last')
-if not spot:
-    sys.exit("Error: kein SPX-Spot erhalten")
-
-# Total-GEX ($ pro 1% Move)
-total_gex = df['gexShares'].sum() * spot * 0.01
-
-# Call-Wall & Put-Wall bestimmen
-wall      = df.groupby('strike')['gexShares'].sum()
-call_wall = int(wall.idxmax())
-put_wall  = int(wall.idxmin())
-
-# Zero-Gamma-Level ermitteln
-zero_gamma = int(wall.sort_index().cumsum().abs().idxmin())
-
-print(f"\nTotal-GEX  : {total_gex/1e9:.2f} Mrd $ / 1 %")
-print(f"Call-Wall  : {call_wall}")
-print(f"Put-Wall   : {put_wall}")
-print(f"Zero-Gamma : {zero_gamma}")
-
-# === 5) Payload bauen & an OptionAlpha senden ============================
 payload = {
-    'sig': 'CONDOR' if total_gex > 2e9 else 'FLAT',
+    'sig': sig,
     'gex': total_gex,
     'cw':  call_wall,
     'pw':  put_wall,
     'zg':  zero_gamma
 }
-print("\nWebhook-Payload:", payload)
 
-wh = requests.post(OA_WEBHOOK, json=payload)
-if wh.status_code != 200:
-    print("⚠️ Webhook-Fehler:", wh.status_code, wh.text)
-else:
-    print("✅ Webhook erfolgreich gesendet.")
+response = requests.post(OA_WEBHOOK, json=payload)
+if not (200 <= response.status_code < 300):
+    sys.exit(f"Webhook error [{response.status_code}]: {response.text}")
+
+print(f"Webhook-Payload: {payload}")
