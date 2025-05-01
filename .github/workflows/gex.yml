@@ -1,0 +1,32 @@
+name: GEX Engine
+
+on:
+  schedule:
+    - cron: '*/15 * * * *'  # alle 15 Minuten
+
+jobs:
+  run-gex:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.x'
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install requests pandas
+
+    - name: Run GEX Engine
+      env:
+        TS_CLIENT_ID:     ${{ secrets.TS_CLIENT_ID }}
+        TS_CLIENT_SECRET: ${{ secrets.TS_CLIENT_SECRET }}
+        TS_USERNAME:      ${{ secrets.TS_USERNAME }}
+        TS_PASSWORD:      ${{ secrets.TS_PASSWORD }}
+        OA_WEBHOOK:       ${{ secrets.OA_WEBHOOK }}
+      run: python gex_engine.py
