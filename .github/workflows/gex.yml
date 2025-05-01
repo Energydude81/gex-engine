@@ -1,8 +1,9 @@
 name: GEX Engine
 
 on:
+  workflow_dispatch:      # ↖ manueller Button in Actions
   schedule:
-    - cron: '*/15 * * * *'  # alle 15 Minuten
+    - cron: '*/15 * * * *'  # alle 15 Minuten (UTC)
 
 jobs:
   run-gex:
